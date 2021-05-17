@@ -1,0 +1,316 @@
+import json
+import time
+import socket
+
+import requests
+from flask import Blueprint
+from flask import request, g, jsonify
+
+import config
+from utils.memcache import mc
+from utils.public import create_order_num, xml_to_dict, date_2_ts
+
+pay = Blueprint("pay", __name__)
+
+ENV = config.configs["current"]
+wx_pay_api = ENV.WX_PAY_API
+message_api = ENV.WECHAT_MESSAGE_API
+templates = ENV.PUBLIC_TEMPLATES
+sms_template = ENV.SMS_TEMPLATE
+
+
+@pay.route("/unifiedorder", methods=["POST"])
+def pay_order():
+    """生成商户订单，并调用wx统一下单api，并把预付单信息返回给前端"""
+    db = g.db
+    data = request.json
+
+    print("预下单入参", data)
+
+    token = data.get("token")
+    mch_name = data.get("mch_name")
+    app_id = data.get("app_id")
+    insurance_code = data.get("insurance_code")
+    body = data.get("body")
+    trade_type = data.get("trade_type")
+    order_num = data.get("order_num")
+    out_trade_no = create_order_num()
+    time_stamp = int(time.time())
+
+    if not all([token, mch_name, app_id, body, insurance_code, trade_type]):
+        return jsonify(code="403", message="参数不全", data={})
+
+    sql = "select premium,id from insurance where code=%s"
+    rs = db.execute(sql, (insurance_code, ), 1)
+    premium = rs[0]
+    product_id = rs[1]
+
+    sql = "select name,id_card from orders where order_num=%s"
+    r1 = db.execute(sql, (order_num,), 1)
+    if r1:
+        u_name = r1[0]
+        id_card = r1[1]
+        s2 = "select b.id from orders a left join wxpay_order b on a.order_num=b.order_num " \
+             "where a.id_card=%s and a.insurance_id=%s and b.status=1"
+        r2 = db.execute(s2, (id_card,product_id), 1)
+        if r2:
+            return jsonify(code="403", message="%s，已购买过此计划!" % u_name, data={})
+
+    total_fee = premium * 100
+
+    user_id = mc.get(token)
+    if user_id == 20336: total_fee = 1
+
+    if not user_id:
+        return jsonify(code="401", message="用户token错误", data={})
+
+    sql = "select openid from user_wechat_info where id=%s"
+    openid = db.execute(sql, (user_id,), 1)[0]
+
+    form_data = {
+        "mch_name": mch_name,
+        "app_id": app_id,
+        "body": body,                           # 商品简单描述  健易保-保险
+        "total_fee": total_fee,                 # 金额 单位：分  int类型
+        "trade_type": trade_type,               # 支付类型（JSAPI -JSAPI支付, NATIVE -Native支付, APP -APP支付）
+        "out_trade_no": out_trade_no,           # 商户订单号
+        "openid": openid
+    }
+
+    print("调用微信服务传参", form_data)
+    response = requests.post(url=wx_pay_api["unifiedorder"], data=json.dumps(form_data), headers={"Content-Type": "application/json"}).text
+    res_data = json.loads(response)
+
+    prepay_id = res_data.pop("prepay_id")
+    mch_id = res_data.pop("mch_id")
+    product_name = res_data.pop("product_name")
+
+    s1 = "select id, out_trade_no from wxpay_order where product_id=%s and order_num=%s"
+    r1 = db.execute(s1, (product_id, order_num), 1)
+    if r1:
+        sql = "update wxpay_order set prepay_id=%s,prepay_time=%s,out_trade_no=%s,total_fee=%s where id=%s"
+        db.execute(sql, (prepay_id, time_stamp, out_trade_no, total_fee, r1[0]), 0)
+    else:
+        sql = "insert into wxpay_order (mch_id, app_id, product_id, product_name,  user_id, openid, out_trade_no, " \
+              "order_num, total_fee, prepay_id, prepay_time) value (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+        db.execute(sql, (mch_id, app_id, product_id, product_name, user_id, openid, out_trade_no, order_num,
+                     total_fee, prepay_id, time_stamp), 0)
+
+    return jsonify(code="200", message="success", data=res_data)
+
+
+# 暂时不用
+@pay.route("/orderquery", methods=["POST"])
+def select_pay_result():
+    """查询支付结果"""
+    data = request.json
+    app_id = data.get("app_id")
+    mch_name = data.get("mch_name")
+    transaction_id = data.get("transaction_id")
+    out_trade_no = data.get("out_trade_no")
+
+    if not all([app_id, mch_name]):
+        return jsonify(code="403", message="参数不全", data={})
+    else:
+        if not (transaction_id or out_trade_no):
+            return jsonify(code="403", message="参数不全", data={})
+
+    form_data = {
+        "app_id": app_id,
+        "mch_name": mch_name,
+        "transaction_id": transaction_id,       # 微信订单号
+        "out_trade_no": out_trade_no
+    }
+
+    response = requests.post(url=wx_pay_api["orderquery"], data=json.dumps(form_data), headers={"Content-Type": "application/json"}).text
+    print(response)
+    return response
+
+
+@pay.route("/pay_notice", methods=["POST"])
+def pay_notice():
+    """支付结果回调"""
+    db = g.db
+    data = request.json
+    print("pay_notice", data)
+
+    result_code = data.get("result_code")
+    app_id = data.get("appid")
+    mch_id = data.get("mch_id")
+    openid = data.get("openid")
+    trade_type = data.get("trade_type")
+    bank_type = data.get("bank_type")
+    total_fee = data.get("total_fee")
+    cash_fee = data.get("cash_fee")
+    transaction_id = data.get("transaction_id")
+    out_trade_no = data.get("out_trade_no")
+    time_end = data.get("time_end")
+
+    if result_code == "SUCCESS":
+        sql = "update wxpay_order a join user_wechat_info b on a.user_id=b.id set a.transaction_id=%s, " \
+              "a.pay_notice_time=%s, a.status=1, b.is_purchase=1 where a.app_id=%s and a.out_trade_no=%s"
+        db.execute(sql, (transaction_id, time_end, app_id, out_trade_no), 0)
+
+        sql = "select a.product_name, a.total_fee, b.phoneNumber, b.name, a.product_id, a.order_num from wxpay_order a " \
+              "join user_wechat_info b on a.user_id=b.id where a.out_trade_no=%s"
+        product_name, total_fee, phone_num, name, product_id, order_num = db.execute(sql, (out_trade_no, ), 1)
+
+        amount = "%.2f" % (total_fee / 100)
+
+        if product_id == 19:
+            s1 = "select project_config from orders where insurance_id=%s and order_num=%s"
+            r1 = db.execute(s1, (product_id, order_num), 1)
+            if r1:
+                conf = json.loads(r1[0])
+                code = conf['invited_code']
+
+                s2 = "update invited_code set status=1 where insurance_id=%s and code=%s"
+                db.execute(s2, (product_id, code), 0)
+
+        if not name or len(name)==0:
+            s1 = "select name from orders where order_num=%s"
+            r1 = db.execute(s1, (order_num,), 1)
+            if r1: name = r1[0]
+
+        template_id = templates[app_id]["pay_success_notice"]
+
+        sql = "select openid from manager_openid where app_id=%s"
+        res = db.execute(sql, (app_id,), 2)
+        openid_list = [tup[0] for tup in res]
+        openid_list.insert(0, (openid, ))
+
+        for openid in openid_list:
+            u_type = 0 if isinstance(openid, tuple) else 1
+            openid = openid[0] if isinstance(openid, tuple) else openid
+
+            template_data = {
+                "app_id": app_id,
+                "openid": openid,
+                "template_id": template_id,
+                "u_type": u_type,
+
+                "keyword_data": {
+                    "keyword1": {"value": out_trade_no, "color": "#173177"},
+                    "keyword2": {"value": product_name, "color": "#173177"},
+                    "keyword3": {"value": amount, "color": "#173177"},
+                },
+
+                "number": out_trade_no,
+                "product_name": product_name,
+                "amount": amount,
+                "name": name
+            }
+            if product_id == 19:
+                template_data['temp_url'] = "https://jyb-b-ghbz.yibaojiankang.com/#/claims/list"
+
+
+            requests.post(url=message_api["template_api"], data=json.dumps(template_data), headers={"Content-Type": "application/json"})
+
+        sms_code = sms_template[app_id]["pay_success"]
+        title = sms_template[app_id]["title"]
+
+        sms_data = {
+            "sms_code": sms_code,
+            "phone_num": phone_num,
+            "title": title,
+            "name": name
+        }
+
+        requests.post(url=message_api["sms_api"], data=json.dumps(sms_data), headers={"Content-Type": "application/json"})
+
+        return "success"
+    else:
+        return "fail"
+
+
+@pay.route("/refund", methods=["POST"])
+def refund():
+    """退款"""
+    db = g.db
+    data = request.json
+    time_stamp = int(time.time())
+
+    mch_name = data.get("mch_name")
+    app_id = data.get("app_id")
+    total_fee = data.get("total_fee")
+    refund_fee = data.get("refund_fee")
+    transaction_id = data.get("transaction_id")
+    out_refund_no = create_order_num()
+
+    if not all([mch_name, app_id, total_fee, refund_fee, transaction_id]):
+        return jsonify(code="403", message="参数不全", data={})
+
+    form_data = {
+        "mch_name": mch_name,
+        "app_id": app_id,
+        "total_fee": total_fee,                                 # 金额 单位：分  int类型
+        "refund_fee": refund_fee,
+        "transaction_id": transaction_id,                       # 微信订单号
+        "out_refund_no": out_refund_no,                         # 退款单号
+    }
+
+    response = requests.post(url=wx_pay_api["refund"], data=json.dumps(form_data), headers={"Content-Type": "application/json"}).text
+    res_data = json.loads(response)
+    print(res_data)
+
+    result_code = res_data.get("result_code")
+    if result_code == "SUCCESS":
+        refund_id = res_data.get("refund_id")
+        refund_fee = res_data.get("refund_fee")
+
+        sql = "update wxpay_order set out_refund_no=%s, refund_fee=%s, apply_refund_time=%s, refund_id=%s, status=5 where app_id=%s and transaction_id=%s"
+        db.execute(sql, (out_refund_no, refund_fee, time_stamp, refund_id, app_id, transaction_id), 0)
+
+        return jsonify(code="200", message="成功申请退款", data={})
+
+    else:
+        print("申请退款失败")
+        return jsonify(code="400", message="申请退款失败", data={})
+
+
+@pay.route("/refund_notice", methods=["POST"])
+def refund_callback():
+    """退款结果回调"""
+    db = g.db
+    data = request.json
+    print("退款结果回调", data)
+
+    transaction_id = data.get("transaction_id")
+    refund_id = data.get("refund_id")
+    refund_status = data.get("refund_status")
+    success_time = date_2_ts(data.get("success_time"), 1)
+
+    if refund_status == "SUCCESS":
+        status = 6
+        sql = "select user_id from wxpay_order where transaction_id=%s"
+        user_id = db.execute(sql, (transaction_id, ), 1)[0]
+
+        # 用户退款时，可能没有领取服务/保险，分开写sql
+        sql = "update user_wechat_info set is_purchase=0 where id=%s"
+        db.execute(sql, (user_id, ), 0)
+
+        # 如果一个用户给多个人付费购买保险，可以根据order_num 处理
+        sql = "update user_insurance set state=2 where user_id=%s"
+        db.execute(sql, (user_id, ), 0)
+
+        sql = "update user_service set status=0 where user_id=%s"
+        db.execute(sql, (user_id, ), 0)
+
+    elif refund_status == "CHANGE":
+        status = 7
+    else:
+        status = 8
+
+    sql = "update wxpay_order set status=%s, refund_notice_time=%s where refund_id=%s"
+    db.execute(sql, (status, success_time, refund_id), 0)
+
+    return "success"
+
+
+
+
+
+
+
+
+
